@@ -17,9 +17,15 @@
 package service
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	common3 "github.com/ontio/ontology/common"
+	common4 "github.com/ontio/ontology/smartcontract/service/native/cross_chain/common"
+	common2 "github.com/polynetwork/poly/common"
+	"github.com/polynetwork/poly/native/service/cross_chain_manager/common"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -167,10 +173,46 @@ func (this *SyncService) allianceToSide(m, n uint32) error {
 				}
 				name := states[0].(string)
 				if name == "makeProof" {
-					toChainID := uint64(states[2].(float64))
-					if toChainID == this.GetSideChainID() {
+					if uint64(states[2].(float64)) == this.GetSideChainID() {
 						key := states[5].(string)
-						txHash, err := this.syncProofToSide(key, i)
+						proof, err := this.aliaSdk.ClientMgr.GetCrossStatesProof(i, key)
+						if err != nil {
+							if strings.Contains(err.Error(), "http post request:") {
+								return fmt.Errorf("[allianceToSide] GetCrossStatesProof error:%s", err)
+							} else {
+								log.Errorf("[allianceToSide] GetCrossStatesProof error:%s", err)
+								continue
+							}
+						}
+						auditpath, _ := hex.DecodeString(proof.AuditPath)
+						value, _, _, _ := ParseAuditpath(auditpath)
+						param := &common.ToMerkleValue{}
+						if err := param.Deserialization(common2.NewZeroCopySource(value)); err != nil {
+							log.Errorf("[allianceToSide] failed to deserialize MakeTxParam (value: %x, err: %v)", value, err)
+							continue
+						}
+
+						var isTarget bool
+						contractSet, ok := this.config.TargetContracts[strconv.FormatUint(param.MakeTxParam.ToChainID, 10)]
+						if ok {
+							toContract, err := common3.AddressParseFromBytes(param.MakeTxParam.ToContractAddress)
+							if err != nil {
+								log.Errorf("[allianceToSide] failed to get contract address from bytes: %v", err)
+								continue
+							}
+							toContractStr := toContract.ToHexString()
+							for _, v := range contractSet {
+								if toContractStr == v {
+									isTarget = true
+									break
+								}
+							}
+							if !isTarget {
+								continue
+							}
+						}
+
+						txHash, err := this.syncProofToSide(proof, i)
 						if err != nil {
 							if strings.Contains(err.Error(), "http post request:") {
 								return fmt.Errorf("[allianceToSide] this.syncProofToSide error:%s", err)
@@ -231,7 +273,49 @@ func (this *SyncService) sideToAlliance(m, n uint32) error {
 				name := states[0].(string)
 				if name == "makeFromOntProof" {
 					key := states[4].(string)
-					txHash, err := this.syncProofToAlia(key, i)
+
+					k, err := hex.DecodeString(key)
+					if err != nil {
+						log.Errorf("[sideToAlliance] hex.DecodeString error: %s", err)
+						continue
+					}
+					proof, err := this.sideSdk.GetCrossStatesProof(i, k)
+					if err != nil {
+						log.Errorf("[sideToAlliance] this.sideSdk.GetCrossStatesProof error: %s", err)
+						continue
+					}
+					auditPath, err := hex.DecodeString(proof.AuditPath)
+					if err != nil {
+						log.Errorf("[sideToAlliance] hex.DecodeString error: %s", err)
+						continue
+					}
+					value, _, _, _ := ParseAuditpath(auditPath)
+					param := &common4.ToMerkleValue{}
+					if err := param.Deserialization(common3.NewZeroCopySource(value)); err != nil {
+						log.Errorf("[sideToAlliance] failed to deserialize MakeTxParam (value: %x, err: %v)", value, err)
+						continue
+					}
+					var isTarget bool
+					contractSet, ok := this.config.TargetContracts[strconv.FormatUint(param.MakeTxParam.ToChainID, 10)]
+					if ok {
+						fromContract, err := common3.AddressParseFromBytes(param.MakeTxParam.FromContractAddress)
+						if err != nil {
+							log.Errorf("[sideToAlliance] failed to get contract address from bytes: %v", err)
+							continue
+						}
+						fromContractStr := fromContract.ToHexString()
+						for _, v := range contractSet {
+							if fromContractStr == v {
+								isTarget = true
+								break
+							}
+						}
+						if !isTarget {
+							continue
+						}
+					}
+
+					txHash, err := this.syncProofToAlia(key, proof, i)
 					if err != nil {
 						_, ok := err.(client.PostErr)
 						if ok {

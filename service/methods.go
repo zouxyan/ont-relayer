@@ -20,6 +20,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	common2 "github.com/ontio/ontology/common"
+	common5 "github.com/ontio/ontology/http/base/common"
+	common3 "github.com/polynetwork/poly-go-sdk/common"
 	"os"
 	"strings"
 	"time"
@@ -143,7 +145,7 @@ func (this *SyncService) syncCrossChainMsgToAlia(height uint32) error {
 	return nil
 }
 
-func (this *SyncService) syncProofToAlia(key string, height uint32) (acommon.Uint256, error) {
+func (this *SyncService) syncProofToAlia(key string, proof *common5.CrossStatesProof, height uint32) (acommon.Uint256, error) {
 	chainIDBytes := common.GetUint64Bytes(this.GetSideChainID())
 	heightBytes := common.GetUint32Bytes(height)
 	params := []byte{}
@@ -160,19 +162,10 @@ func (this *SyncService) syncProofToAlia(key string, height uint32) (acommon.Uin
 		}
 	}
 
-	k, err := hex.DecodeString(key)
-	if err != nil {
-		return acommon.UINT256_EMPTY, fmt.Errorf("[syncProofToAlia] hex.DecodeString error: %s", err)
-	}
-	proof, err := this.sideSdk.GetCrossStatesProof(height, k)
-	if err != nil {
-		return acommon.UINT256_EMPTY, fmt.Errorf("[syncProofToAlia] this.sideSdk.GetCrossStatesProof error: %s", err)
-	}
 	auditPath, err := hex.DecodeString(proof.AuditPath)
 	if err != nil {
 		return acommon.UINT256_EMPTY, fmt.Errorf("[syncProofToAlia] hex.DecodeString error: %s", err)
 	}
-
 	retry := &db.Retry{
 		Height: height,
 		Key:    key,
@@ -293,13 +286,10 @@ func (this *SyncService) syncHeaderToSide(height uint32) error {
 	return nil
 }
 
-func (this *SyncService) syncProofToSide(key string, height uint32) (common2.Uint256, error) {
+func (this *SyncService) syncProofToSide(proof *common3.MerkleProof, height uint32) (common2.Uint256, error) {
 	chainIDBytes := common.GetUint64Bytes(this.aliaSdk.ChainId)
 	heightBytes := common.GetUint32Bytes(height + 1)
-	proof, err := this.aliaSdk.ClientMgr.GetCrossStatesProof(height, key)
-	if err != nil {
-		return common2.UINT256_EMPTY, fmt.Errorf("[syncProofToSide] this.sideSdk.GetMptProof error: %s", err)
-	}
+
 	param := &cross_chain_manager.ProcessCrossChainTxParam{
 		Address:     this.sideAccount.Address,
 		FromChainID: this.aliaSdk.ChainId,
@@ -392,4 +382,38 @@ func checkIfExist(dir string) bool {
 		return false
 	}
 	return true
+}
+
+func ParseAuditpath(path []byte) ([]byte, []byte, [][32]byte, error) {
+	source := acommon.NewZeroCopySource(path)
+	/*
+		l, eof := source.NextUint64()
+		if eof {
+			return nil, nil, nil, nil
+		}
+	*/
+	value, eof := source.NextVarBytes()
+	if eof {
+		return nil, nil, nil, nil
+	}
+	size := int((source.Size() - source.Pos()) / acommon.UINT256_SIZE)
+	pos := make([]byte, 0)
+	hashs := make([][32]byte, 0)
+	for i := 0; i < size; i++ {
+		f, eof := source.NextByte()
+		if eof {
+			return nil, nil, nil, nil
+		}
+		pos = append(pos, f)
+
+		v, eof := source.NextHash()
+		if eof {
+			return nil, nil, nil, nil
+		}
+		var onehash [32]byte
+		copy(onehash[:], (v.ToArray())[0:32])
+		hashs = append(hashs, onehash)
+	}
+
+	return value, pos, hashs, nil
 }

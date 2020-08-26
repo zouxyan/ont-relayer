@@ -10,5 +10,8 @@
   "GasPrice":500,
   "GasLimit":200000,
   "SideToAlliForceSyncHeight": 0,
-  "AlliToSideForceSyncHeight": 0
+  "AlliToSideForceSyncHeight": 0,
+  "TargetContracts": {
+    "": [ ]
+  }
 }
