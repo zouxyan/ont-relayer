@@ -13,7 +13,7 @@
 * GNU Lesser General Public License for more details.
 * You should have received a copy of the GNU Lesser General Public License
 * along with The poly network . If not, see <http://www.gnu.org/licenses/>.
-*/
+ */
 package service
 
 import (
@@ -22,6 +22,11 @@ import (
 	"fmt"
 	common3 "github.com/ontio/ontology/common"
 	common4 "github.com/ontio/ontology/smartcontract/service/native/cross_chain/common"
+	"github.com/ontio/ontology/smartcontract/service/native/cross_chain/cross_chain_manager"
+	"github.com/ontio/ontology/smartcontract/service/native/cross_chain/header_sync"
+	common5 "github.com/polynetwork/ont-relayer/common"
+	"github.com/polynetwork/ont-relayer/rest/http/restful"
+	utils2 "github.com/polynetwork/ont-relayer/rest/utils"
 	common2 "github.com/polynetwork/poly/common"
 	"github.com/polynetwork/poly/native/service/cross_chain_manager/common"
 	"os"
@@ -36,7 +41,7 @@ import (
 	"github.com/polynetwork/ont-relayer/log"
 	asdk "github.com/polynetwork/poly-go-sdk"
 	"github.com/polynetwork/poly-go-sdk/client"
-	vconfig "github.com/polynetwork/poly/consensus/vbft/config"
+	"github.com/polynetwork/poly/consensus/vbft/config"
 	autils "github.com/polynetwork/poly/native/service/utils"
 )
 
@@ -120,6 +125,7 @@ func (this *SyncService) SideToAlliance() {
 		if err != nil {
 			log.Errorf("[SideToAlliance] this.sideToAlliance error:", err)
 		}
+
 		time.Sleep(time.Duration(this.config.ScanInterval) * time.Second)
 	}
 }
@@ -207,21 +213,70 @@ func (this *SyncService) allianceToSide(m, n uint32) error {
 									break
 								}
 							}
-							if !isTarget {
-								continue
-							}
+						}
+						if !isTarget {
+							continue
 						}
 
-						txHash, err := this.syncProofToSide(proof, i)
-						if err != nil {
-							if strings.Contains(err.Error(), "http post request:") {
-								return fmt.Errorf("[allianceToSide] this.syncProofToSide error:%s", err)
-							} else {
-								log.Errorf("[allianceToSide] this.syncProofToSide error:%s", err)
+						chainIDBytes := autils.GetUint64Bytes(this.aliaSdk.ChainId)
+						heightBytes := autils.GetUint32Bytes(i + 1)
+						var rawHeader []byte
+						v, err := this.sideSdk.GetStorage(utils.HeaderSyncContractAddress.ToHexString(),
+							common5.ConcatKey([]byte(header_sync.HEADER_INDEX), chainIDBytes, heightBytes))
+						if len(v) == 0 {
+							blockHeader, err := this.aliaSdk.GetHeaderByHeight(i + 1)
+							if err != nil {
+								log.Errorf("[allianceToSide] this.mainSdk.GetHeaderByHeight error:%s", err)
 							}
+							rawHeader = blockHeader.ToArray()
 						}
-						log.Infof("[allianceToSide] syncProofToSide ( ont_tx: %s, poly_tx: %s )",
-							txHash.ToHexString(), event.TxHash)
+
+						toContractAddr, err := common2.AddressParseFromBytes(param.MakeTxParam.ToContractAddress)
+						if err != nil {
+							log.Errorf("[allianceToSide] AddressParseFromBytes error: %v", err)
+							continue
+						}
+						args := &utils2.TxArgs{}
+						if err = args.Deserialization(common3.NewZeroCopySource(param.MakeTxParam.Args)); err != nil {
+							return fmt.Errorf("[syncProofToAlia] failed to deserialize tx args: %v", err)
+						}
+						toAddr, err := common3.AddressParseFromBytes(args.ToAddr)
+						if err != nil {
+							log.Errorf("[allianceToSide] AddressParseFromBytes error: %v", err)
+							continue
+						}
+						toAsset, err := common3.AddressParseFromBytes(args.ToAssetHash)
+						if err != nil {
+							log.Errorf("[allianceToSide] AddressParseFromBytes toAddr error: %v", err)
+							continue
+						}
+						timeStart := time.Now()
+					RETRY:
+						if err := restful.FlamCli.SendOntInfo(
+							param.MakeTxParam.ToChainID,
+							args.Amt.Uint64(),
+							toContractAddr.ToHexString(),
+							cross_chain_manager.PROCESS_CROSS_CHAIN_TX,
+							toAddr.ToBase58(),
+							toAsset.ToHexString(),
+							hex.EncodeToString(param.MakeTxParam.TxHash),
+							[]string{
+								strconv.FormatUint(this.aliaSdk.ChainId, 10),
+								strconv.FormatUint(uint64(i+1), 10),
+								proof.AuditPath,
+								hex.EncodeToString(rawHeader),
+							}); err != nil {
+							if time.Now().Sub(timeStart) > this.config.RetryTimeout*time.Hour {
+								log.Errorf("[allianceToSide] retry timeout and failed to send ( poly_hash: %s ) to flamingo: %v",
+									event.TxHash, err)
+								continue
+							}
+							log.Debugf("[allianceToSide] failed to send ( poly_hash: %s ) to flamingo and retry now: %s",
+								event.TxHash, strings.Split(err.Error(), ",")[0])
+							time.Sleep(time.Second * this.config.RetryDuration)
+							goto RETRY
+						}
+						log.Infof("[allianceToSide] send ont info to flamingo ( poly_tx: %s )", event.TxHash)
 					}
 				}
 			}
@@ -258,9 +313,11 @@ func (this *SyncService) sideToAlliance(m, n uint32) error {
 		if err != nil {
 			return fmt.Errorf("[sideToAlliance] this.sideSdk.GetSmartContractEventByBlock error:%s", err)
 		}
+		confirmedTxArr := make([]string, 0)
 		for _, event := range events {
+			tx, err := this.sideSdk.GetTransaction(event.TxHash)
 			if err != nil {
-				return fmt.Errorf("[sideToAlliance] common.Uint256FromHexString error:%s", err)
+				return fmt.Errorf("[sideToAlliance] GetTransaction error:%s", err)
 			}
 			for _, notify := range event.Notify {
 				states, ok := notify.States.([]interface{})
@@ -271,7 +328,9 @@ func (this *SyncService) sideToAlliance(m, n uint32) error {
 					continue
 				}
 				name := states[0].(string)
-				if name == "makeFromOntProof" {
+				if name == "verifyToOntProof" {
+					confirmedTxArr = append(confirmedTxArr, states[2].(string))
+				} else if name == "makeFromOntProof" {
 					key := states[4].(string)
 
 					k, err := hex.DecodeString(key)
@@ -290,15 +349,15 @@ func (this *SyncService) sideToAlliance(m, n uint32) error {
 						continue
 					}
 					value, _, _, _ := ParseAuditpath(auditPath)
-					param := &common4.ToMerkleValue{}
+					param := &common4.MakeTxParam{}
 					if err := param.Deserialization(common3.NewZeroCopySource(value)); err != nil {
 						log.Errorf("[sideToAlliance] failed to deserialize MakeTxParam (value: %x, err: %v)", value, err)
 						continue
 					}
 					var isTarget bool
-					contractSet, ok := this.config.TargetContracts[strconv.FormatUint(param.MakeTxParam.ToChainID, 10)]
+					contractSet, ok := this.config.TargetContracts[strconv.FormatUint(this.GetSideChainID(), 10)]
 					if ok {
-						fromContract, err := common3.AddressParseFromBytes(param.MakeTxParam.FromContractAddress)
+						fromContract, err := common3.AddressParseFromBytes(param.FromContractAddress)
 						if err != nil {
 							log.Errorf("[sideToAlliance] failed to get contract address from bytes: %v", err)
 							continue
@@ -310,12 +369,12 @@ func (this *SyncService) sideToAlliance(m, n uint32) error {
 								break
 							}
 						}
-						if !isTarget {
-							continue
-						}
+					}
+					if !isTarget {
+						continue
 					}
 
-					txHash, err := this.syncProofToAlia(key, proof, i)
+					txHash, err := this.syncProofToAlia(event.TxHash, key, tx, proof, i, param)
 					if err != nil {
 						_, ok := err.(client.PostErr)
 						if ok {
@@ -332,6 +391,12 @@ func (this *SyncService) sideToAlliance(m, n uint32) error {
 		this.aliaSyncHeight++
 		if err := this.db.PutOntHeight(i); err != nil {
 			log.Errorf("failed to put ont height: %v", err)
+		}
+		if len(confirmedTxArr) > 0 {
+			if err := restful.FlamCli.SendConfirmedTxArr(confirmedTxArr); err != nil {
+				log.Errorf("failed to send confirmed tx array: %v", err)
+				//TODO: RETRY
+			}
 		}
 	}
 	return nil

@@ -13,20 +13,22 @@
 * GNU Lesser General Public License for more details.
 * You should have received a copy of the GNU Lesser General Public License
 * along with The poly network . If not, see <http://www.gnu.org/licenses/>.
-*/
+ */
 package service
 
 import (
 	"encoding/hex"
 	"fmt"
 	common2 "github.com/ontio/ontology/common"
+	"github.com/ontio/ontology/core/types"
 	common5 "github.com/ontio/ontology/http/base/common"
-	common3 "github.com/polynetwork/poly-go-sdk/common"
+	common6 "github.com/ontio/ontology/smartcontract/service/native/cross_chain/common"
+	"github.com/polynetwork/ont-relayer/rest/http/restful"
+	utils2 "github.com/polynetwork/ont-relayer/rest/utils"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/ontio/ontology/smartcontract/service/native/cross_chain/cross_chain_manager"
 	"github.com/ontio/ontology/smartcontract/service/native/cross_chain/header_sync"
 	"github.com/ontio/ontology/smartcontract/service/native/utils"
 	"github.com/polynetwork/ont-relayer/common"
@@ -145,7 +147,7 @@ func (this *SyncService) syncCrossChainMsgToAlia(height uint32) error {
 	return nil
 }
 
-func (this *SyncService) syncProofToAlia(key string, proof *common5.CrossStatesProof, height uint32) (acommon.Uint256, error) {
+func (this *SyncService) syncProofToAlia(ontTx, key string, tx *types.Transaction, proof *common5.CrossStatesProof, height uint32, param *common6.MakeTxParam) (acommon.Uint256, error) {
 	chainIDBytes := common.GetUint64Bytes(this.GetSideChainID())
 	heightBytes := common.GetUint32Bytes(height)
 	params := []byte{}
@@ -166,19 +168,31 @@ func (this *SyncService) syncProofToAlia(key string, proof *common5.CrossStatesP
 	if err != nil {
 		return acommon.UINT256_EMPTY, fmt.Errorf("[syncProofToAlia] hex.DecodeString error: %s", err)
 	}
+	args := &utils2.TxArgs{}
+	if err = args.Deserialization(common2.NewZeroCopySource(param.Args)); err != nil {
+		return acommon.UINT256_EMPTY, fmt.Errorf("[syncProofToAlia] failed to deserialize tx args: %v", err)
+	}
+	fromContract, err := common2.AddressParseFromBytes(param.FromContractAddress)
+	if err != nil {
+		return acommon.UINT256_EMPTY, fmt.Errorf("[syncProofToAlia] failed to AddressParseFromBytes: %v", err)
+	}
 	retry := &db.Retry{
-		Height: height,
-		Key:    key,
+		Height:              height,
+		Key:                 key,
+		OntTx:               ontTx,
+		ToChainId:           param.ToChainID,
+		Sender:              tx.SignedAddr[0],
+		Args:                param.Args,
+		FromContractAddress: fromContract,
 	}
 	sink := acommon.NewZeroCopySink(nil)
 	retry.Serialization(sink)
 
-	txHash, err := this.aliaSdk.Native.Ccm.ImportOuterTransfer(this.GetSideChainID(), nil, height, auditPath,
+	txHash, terr := this.aliaSdk.Native.Ccm.ImportOuterTransfer(this.GetSideChainID(), nil, height, auditPath,
 		this.aliaAccount.Address[:], params, this.aliaAccount)
-	if err != nil {
-		if strings.Contains(err.Error(), "chooseUtxos, current utxo is not enough") {
+	if terr != nil {
+		if strings.Contains(terr.Error(), "chooseUtxos, current utxo is not enough") {
 			log.Infof("[syncProofToAlia] invokeNativeContract error: %s", err)
-
 			err = this.db.PutRetry(sink.Bytes())
 			if err != nil {
 				return acommon.UINT256_EMPTY, fmt.Errorf("[syncProofToAlia] this.db.PutRetry error: %s", err)
@@ -186,14 +200,60 @@ func (this *SyncService) syncProofToAlia(key string, proof *common5.CrossStatesP
 			log.Infof("[syncProofToAlia] put tx into retry db, height %d, key %s", height, key)
 			return acommon.UINT256_EMPTY, nil
 		} else {
-			return acommon.UINT256_EMPTY, err
+			timeStart := time.Now()
+		RETRY1:
+			if err := restful.FlamCli.SendTxPair(
+				this.GetSideChainID(),
+				param.ToChainID,
+				tx.SignedAddr[0].ToBase58(),
+				hex.EncodeToString(args.ToAddr),
+				acommon.UINT256_EMPTY.ToHexString(),
+				ontTx,
+				fromContract.ToHexString(),
+				args.Amt.Uint64(),
+				-1); err != nil {
+				if time.Now().Sub(timeStart) > this.config.RetryTimeout*time.Hour {
+					log.Errorf("[syncProofToAlia] failed to send tx pair (ont_tx: %s, status: FAILED, error: %v)",
+						ontTx, err)
+					return acommon.UINT256_EMPTY, terr
+				}
+				log.Debugf("[syncProofToAlia] failed to send tx pair (ont_tx: %s, status: FAILED, error: %v)",
+					ontTx, strings.Split(err.Error(), ",")[0])
+				time.Sleep(time.Second * this.config.RetryDuration)
+				goto RETRY1
+			}
+			log.Infof("[syncProofToAlia] success to send tx pair (ont_tx: %s, status: FAILED, error: %v)",
+				ontTx, err)
+			return acommon.UINT256_EMPTY, terr
 		}
 	}
-
-	err = this.db.PutCheck(txHash.ToHexString(), sink.Bytes())
-	if err != nil {
+	if err = this.db.PutCheck(txHash.ToHexString(), sink.Bytes()); err != nil {
 		return acommon.UINT256_EMPTY, fmt.Errorf("[syncProofToAlia] this.db.PutCheck error: %s", err)
 	}
+	timeStart := time.Now()
+RETRY2:
+	if err = restful.FlamCli.SendTxPair(
+		this.GetSideChainID(),
+		param.ToChainID,
+		tx.SignedAddr[0].ToBase58(),
+		hex.EncodeToString(args.ToAddr),
+		txHash.ToHexString(),
+		ontTx,
+		fromContract.ToHexString(),
+		args.Amt.Uint64(),
+		1); err != nil {
+		if time.Now().Sub(timeStart) > this.config.RetryTimeout*time.Hour {
+			log.Errorf("[syncProofToAlia] failed to send tx pair (ont_tx: %s, status: pending, error: %v)",
+				ontTx, err)
+			return txHash, nil
+		}
+		log.Debugf("[syncProofToAlia] failed to send tx pair (ont_tx: %s, status: pending, error: %v)",
+			ontTx, strings.Split(err.Error(), ",")[0])
+		time.Sleep(time.Second * this.config.RetryDuration)
+		goto RETRY2
+	}
+	log.Infof("[syncProofToAlia] success to send tx pair (poly_tx: %s, ont_tx: %s, status: PENDING)",
+		txHash.ToHexString(), ontTx, err)
 
 	return txHash, nil
 }
@@ -231,21 +291,49 @@ func (this *SyncService) retrySyncProofToAlia(v []byte) error {
 			return fmt.Errorf("[retrySyncProofToAlia] hex.DecodeString error: %s", err)
 		}
 	}
+	args := &utils2.TxArgs{}
+	if err = args.Deserialization(common2.NewZeroCopySource(retry.Args)); err != nil {
+		return fmt.Errorf("[syncProofToAlia] failed to deserialize tx args: %v", err)
+	}
 
-	txHash, err := this.aliaSdk.Native.Ccm.ImportOuterTransfer(this.GetSideChainID(),
+	txHash, terr := this.aliaSdk.Native.Ccm.ImportOuterTransfer(this.GetSideChainID(),
 		nil, retry.Height, auditPath, this.aliaAccount.Address[:], params, this.aliaAccount)
-	if err != nil {
-		if strings.Contains(err.Error(), "chooseUtxos, current utxo is not enough") {
+	if terr != nil {
+		if strings.Contains(terr.Error(), "chooseUtxos, current utxo is not enough") {
 			log.Infof("[retrySyncProofToAlia] invokeNativeContract error: %s", err)
 			return nil
 		} else {
 			if err := this.db.DeleteRetry(v); err != nil {
 				return fmt.Errorf("[retrySyncProofToAlia] this.db.DeleteRetry error: %s", err)
 			}
-			return fmt.Errorf("[retrySyncProofToAlia] invokeNativeContract error: %s", err)
+			timeStart := time.Now()
+		RETRY1:
+			err := restful.FlamCli.SendTxPair(
+				this.GetSideChainID(),
+				retry.ToChainId,
+				retry.Sender.ToBase58(),
+				hex.EncodeToString(args.ToAddr),
+				acommon.UINT256_EMPTY.ToHexString(),
+				retry.OntTx,
+				retry.FromContractAddress.ToHexString(),
+				args.Amt.Uint64(),
+				-1)
+			if err != nil {
+				if time.Now().Sub(timeStart) > this.config.RetryTimeout*time.Hour {
+					log.Errorf("[retrySyncProofToAlia] failed to send tx pair (ont_tx: %s, status: FAILED, error: %v)",
+						retry.OntTx, err)
+					return fmt.Errorf("[retrySyncProofToAlia] invokeNativeContract error: %s", terr)
+				}
+				log.Debugf("[retrySyncProofToAlia] failed to send tx pair (ont_tx: %s, status: FAILED, error: %v)",
+					retry.OntTx, strings.Split(err.Error(), ",")[0])
+				time.Sleep(time.Second * this.config.RetryDuration)
+				goto RETRY1
+			}
+			log.Infof("[retrySyncProofToAlia] success to send tx pair (ont_tx: %s, status: FAILED, error: %v)",
+				retry.OntTx, err)
+			return fmt.Errorf("[retrySyncProofToAlia] invokeNativeContract error: %s", terr)
 		}
 	}
-
 	err = this.db.PutCheck(txHash.ToHexString(), v)
 	if err != nil {
 		return fmt.Errorf("[retrySyncProofToAlia] this.db.PutCheck error: %s", err)
@@ -255,7 +343,32 @@ func (this *SyncService) retrySyncProofToAlia(v []byte) error {
 		return fmt.Errorf("[retrySyncProofToAlia] this.db.DeleteRetry error: %s", err)
 	}
 
-	log.Infof("[retrySyncProofToAlia] syncProofToAlia txHash is :", txHash.ToHexString())
+	log.Infof("[retrySyncProofToAlia] syncProofToAlia (ont_tx: %s, poly_tx: %s, status: PENDING)",
+		retry.OntTx, txHash.ToHexString())
+	timeStart := time.Now()
+RETRY2:
+	if err := restful.FlamCli.SendTxPair(
+		this.GetSideChainID(),
+		retry.ToChainId,
+		retry.Sender.ToBase58(),
+		hex.EncodeToString(args.ToAddr),
+		txHash.ToHexString(),
+		retry.OntTx,
+		retry.FromContractAddress.ToHexString(),
+		args.Amt.Uint64(),
+		1); err != nil {
+		if time.Now().Sub(timeStart) > this.config.RetryTimeout*time.Hour {
+			log.Errorf("[retrySyncProofToAlia] failed to send tx pair (ont_tx: %s, status: PENDING, error: %v)",
+				retry.OntTx, err)
+			return nil
+		}
+		log.Debugf("[retrySyncProofToAlia] failed to send tx pair (ont_tx: %s, status: PENDING, error: %v)",
+			retry.OntTx, strings.Split(err.Error(), ",")[0])
+		time.Sleep(time.Second * this.config.RetryDuration)
+		goto RETRY2
+	}
+	log.Infof("[retrySyncProofToAlia] success to send tx pair (ont_tx: %s, poly_tx: %s, status: PENDING)",
+		retry.OntTx, txHash.ToHexString())
 	return nil
 }
 
@@ -286,36 +399,6 @@ func (this *SyncService) syncHeaderToSide(height uint32) error {
 	return nil
 }
 
-func (this *SyncService) syncProofToSide(proof *common3.MerkleProof, height uint32) (common2.Uint256, error) {
-	chainIDBytes := common.GetUint64Bytes(this.aliaSdk.ChainId)
-	heightBytes := common.GetUint32Bytes(height + 1)
-
-	param := &cross_chain_manager.ProcessCrossChainTxParam{
-		Address:     this.sideAccount.Address,
-		FromChainID: this.aliaSdk.ChainId,
-		Height:      height + 1,
-		Proof:       proof.AuditPath,
-	}
-	v, err := this.sideSdk.GetStorage(utils.HeaderSyncContractAddress.ToHexString(),
-		common.ConcatKey([]byte(header_sync.HEADER_INDEX), chainIDBytes, heightBytes))
-	if len(v) == 0 {
-		blockHeader, err := this.aliaSdk.GetHeaderByHeight(height + 1)
-		if err != nil {
-			log.Errorf("[syncHeaderToSide] this.mainSdk.GetHeaderByHeight error:%s", err)
-		}
-		param.Header = blockHeader.ToArray()
-	}
-
-	contractAddress := utils.CrossChainContractAddress
-	method := cross_chain_manager.PROCESS_CROSS_CHAIN_TX
-	txHash, err := this.sideSdk.Native.InvokeNativeContract(this.GetGasPrice(), this.GetGasLimit(),
-		this.sideAccount, this.sideAccount, codeVersion, contractAddress, method, []interface{}{param})
-	if err != nil {
-		return common2.UINT256_EMPTY, err
-	}
-	return txHash, nil
-}
-
 func (this *SyncService) checkDoneTx() error {
 	checkMap, err := this.db.GetAllCheck()
 	if err != nil {
@@ -330,17 +413,50 @@ func (this *SyncService) checkDoneTx() error {
 			log.Infof("[checkDoneTx] can not find event of hash %s", k)
 			continue
 		}
+		polyStatus := 0
 		if event.State != 1 {
 			log.Infof("[checkDoneTx] state of tx %s is not success", k)
 			err := this.db.PutRetry(v)
 			if err != nil {
-				log.Errorf("[checkDoneTx] this.db.PutRetry error:%s", err)
+				return fmt.Errorf("[checkDoneTx] this.db.PutRetry error:%s", err)
 			}
+			polyStatus = -1
+		}
+		retry := &db.Retry{}
+		if err := retry.Deserialization(acommon.NewZeroCopySource(v)); err != nil {
+			return fmt.Errorf("[checkDoneTx] failed to Deserialization: %v", err)
+		}
+		args := &utils2.TxArgs{}
+		if err = args.Deserialization(common2.NewZeroCopySource(retry.Args)); err != nil {
+			return fmt.Errorf("[checkDoneTx] failed to deserialize tx args: %v", err)
 		}
 		err = this.db.DeleteCheck(k)
 		if err != nil {
 			log.Errorf("[checkDoneTx] this.db.DeleteCheck error:%s", err)
 		}
+		timeStart := time.Now()
+	RETRY:
+		if err := restful.FlamCli.UpdateTxPair(
+			this.GetSideChainID(),
+			retry.ToChainId,
+			retry.Sender.ToBase58(),
+			hex.EncodeToString(args.ToAddr),
+			k,
+			retry.OntTx,
+			retry.FromContractAddress.ToHexString(),
+			args.Amt.Uint64(),
+			polyStatus); err != nil {
+			if time.Now().Sub(timeStart) > this.config.RetryTimeout*time.Hour {
+				log.Errorf("[checkDoneTx] - failed to update tx pair ( poly_txhash: %s, ont_txhash: %s, status: %d, error: %v)",
+					k, retry.OntTx, polyStatus, err)
+				continue
+			}
+			log.Debugf("[checkDoneTx] failed to update tx pair ( poly_txhash: %s, ont_txhash: %s, status: %d, error: %s)",
+				k, retry.OntTx, polyStatus, strings.Split(err.Error(), ",")[0])
+			time.Sleep(time.Second * this.config.RetryDuration)
+			goto RETRY
+		}
+		log.Infof("[checkDoneTx] success to send tx pair ( poly_txhash: %s, ont_txhash: %s, status: %d )", k, retry.OntTx, polyStatus)
 	}
 
 	return nil

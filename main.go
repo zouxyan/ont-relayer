@@ -13,11 +13,13 @@
 * GNU Lesser General Public License for more details.
 * You should have received a copy of the GNU Lesser General Public License
 * along with The poly network . If not, see <http://www.gnu.org/licenses/>.
-*/
+ */
 package main
 
 import (
 	"fmt"
+	"github.com/polynetwork/ont-relayer/rest/http/restful"
+	"github.com/polynetwork/poly/common/password"
 	"os"
 	"os/signal"
 	"runtime"
@@ -28,6 +30,7 @@ import (
 	"github.com/polynetwork/ont-relayer/common"
 	"github.com/polynetwork/ont-relayer/config"
 	"github.com/polynetwork/ont-relayer/log"
+	rest_serv "github.com/polynetwork/ont-relayer/rest/service"
 	"github.com/polynetwork/ont-relayer/service"
 	asdk "github.com/polynetwork/poly-go-sdk"
 	"github.com/urfave/cli"
@@ -91,6 +94,30 @@ func startSync(ctx *cli.Context) {
 		return
 	}
 
+	restful.FlamCli = restful.NewRestClient(config.DefConfig.FlamingoServer)
+	if config.DefConfig.JWTToken == "" {
+		fmt.Println("please input your secret code to get JWT token:")
+		rawSecret, err := password.GetPassword()
+		if err != nil {
+			panic(fmt.Errorf("failed to get secret: %v", err))
+		}
+		config.DefConfig.JWTToken, err = restful.FlamCli.GetJWTToken(string(rawSecret))
+		if err != nil {
+			panic(fmt.Errorf("failed to get JWT token: %v", err))
+		}
+		if err := config.DefConfig.Save(configPath); err != nil {
+			panic(fmt.Errorf("failed to save the config file: %v", err))
+		}
+		fmt.Println("success!")
+	}
+	restful.FlamCli.Jwt = config.DefConfig.JWTToken
+
+	server := restful.InitRestServer(rest_serv.NewService(), config.DefConfig.LocalServerPort, config.DefConfig.FlamingoServer)
+	go func() {
+		if err := server.Start(); err != nil {
+			panic(err)
+		}
+	}()
 	syncService := service.NewSyncService(aliaAccount, sideAccount, aliaSdk, sideSdk)
 	syncService.Run()
 

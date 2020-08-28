@@ -14,7 +14,7 @@
 * GNU Lesser General Public License for more details.
 * You should have received a copy of the GNU Lesser General Public License
 * along with The poly network . If not, see <http://www.gnu.org/licenses/>.
-*/
+ */
 package config
 
 import (
@@ -22,11 +22,16 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"time"
 )
 
 const (
 	DEFAULT_CONFIG_FILE_NAME = "./config.json"
 	DEFAULT_LOG_LEVEL        = 2
+)
+
+var (
+	RelayerStatus uint64
 )
 
 //Default config instance
@@ -46,7 +51,12 @@ type Config struct {
 	GasLimit                  uint64
 	SideToAlliForceSyncHeight uint64
 	AlliToSideForceSyncHeight uint64
-	TargetContracts map[string][]string
+	TargetContracts           map[string][]string
+	LocalServerPort           uint64
+	FlamingoServer            string
+	JWTToken                  string
+	RetryDuration             time.Duration
+	RetryTimeout              time.Duration
 }
 
 //NewConfig retuen a TestConfig instance
@@ -91,4 +101,15 @@ func (this *Config) readFile(fileName string) ([]byte, error) {
 		return nil, fmt.Errorf("ioutil.ReadAll %s error %s", fileName, err)
 	}
 	return data, nil
+}
+
+func (this *Config) Save(fileName string) error {
+	data, err := json.MarshalIndent(this, "", "\t")
+	if err != nil {
+		return err
+	}
+	if err := ioutil.WriteFile(fileName, data, 0644); err != nil {
+		return fmt.Errorf("failed to write conf file: %v", err)
+	}
+	return nil
 }

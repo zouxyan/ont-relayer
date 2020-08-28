@@ -5,3 +5,6 @@ ont_relayer
 wallet1.dat
 wallet2.dat
 config-debug.json
+config-flam-debug.json
+*.log
+boltdb

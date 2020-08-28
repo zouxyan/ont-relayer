@@ -13,7 +13,7 @@
 * GNU Lesser General Public License for more details.
 * You should have received a copy of the GNU Lesser General Public License
 * along with The poly network . If not, see <http://www.gnu.org/licenses/>.
-*/
+ */
 package db
 
 import (
@@ -31,8 +31,8 @@ import (
 const MAX_NUM = 1000
 
 var (
-	BKTCheck = []byte("Check")
-	BKTRetry = []byte("Retry")
+	BKTCheck  = []byte("Check")
+	BKTRetry  = []byte("Retry")
 	BKTHeight = []byte("Height")
 )
 
