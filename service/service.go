@@ -25,7 +25,6 @@ import (
 	common2 "github.com/polynetwork/poly/common"
 	"github.com/polynetwork/poly/native/service/cross_chain_manager/common"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -36,7 +35,7 @@ import (
 	"github.com/polynetwork/ont-relayer/log"
 	asdk "github.com/polynetwork/poly-go-sdk"
 	"github.com/polynetwork/poly-go-sdk/client"
-	vconfig "github.com/polynetwork/poly/consensus/vbft/config"
+	"github.com/polynetwork/poly/consensus/vbft/config"
 	autils "github.com/polynetwork/poly/native/service/utils"
 )
 
@@ -193,18 +192,29 @@ func (this *SyncService) allianceToSide(m, n uint32) error {
 						}
 
 						var isTarget bool
-						contractSet, ok := this.config.TargetContracts[strconv.FormatUint(param.MakeTxParam.ToChainID, 10)]
-						if ok {
+						if len(this.config.TargetContracts) > 0 {
 							toContract, err := common3.AddressParseFromBytes(param.MakeTxParam.ToContractAddress)
 							if err != nil {
 								log.Errorf("[allianceToSide] failed to get contract address from bytes: %v", err)
 								continue
 							}
 							toContractStr := toContract.ToHexString()
-							for _, v := range contractSet {
-								if toContractStr == v {
-									isTarget = true
-									break
+							for _, v := range this.config.TargetContracts {
+								toChainIdArr, ok := v[toContractStr]
+								if ok {
+									if len(toChainIdArr["inbound"]) == 0 {
+										isTarget = true
+										break
+									}
+									for _, id := range toChainIdArr["inbound"] {
+										if id == param.FromChainID {
+											isTarget = true
+											break
+										}
+									}
+									if isTarget {
+										break
+									}
 								}
 							}
 							if !isTarget {
@@ -217,10 +227,15 @@ func (this *SyncService) allianceToSide(m, n uint32) error {
 							if strings.Contains(err.Error(), "http post request:") {
 								return fmt.Errorf("[allianceToSide] this.syncProofToSide error:%s", err)
 							} else {
-								log.Errorf("[allianceToSide] this.syncProofToSide error:%s", err)
+								if strings.Contains(err.Error(), "tx already done") {
+									log.Debugf("[allianceToSide] poly tx %s already on ontology", event.TxHash)
+									continue
+								}
+								log.Errorf("[allianceToSide] poly tx %s failed to relay: %v", event.TxHash, err)
+								continue
 							}
 						}
-						log.Infof("[allianceToSide] syncProofToSide ( ont_tx: %s, poly_tx: %s )",
+						log.Infof("[allianceToSide] relay poly tx to ontology ( ont_tx: %s, poly_tx: %s )",
 							txHash.ToHexString(), event.TxHash)
 					}
 				}
@@ -290,24 +305,35 @@ func (this *SyncService) sideToAlliance(m, n uint32) error {
 						continue
 					}
 					value, _, _, _ := ParseAuditpath(auditPath)
-					param := &common4.ToMerkleValue{}
+					param := &common4.MakeTxParam{}
 					if err := param.Deserialization(common3.NewZeroCopySource(value)); err != nil {
 						log.Errorf("[sideToAlliance] failed to deserialize MakeTxParam (value: %x, err: %v)", value, err)
 						continue
 					}
 					var isTarget bool
-					contractSet, ok := this.config.TargetContracts[strconv.FormatUint(param.MakeTxParam.ToChainID, 10)]
-					if ok {
-						fromContract, err := common3.AddressParseFromBytes(param.MakeTxParam.FromContractAddress)
+					if len(this.config.TargetContracts) > 0 {
+						fromContract, err := common3.AddressParseFromBytes(param.FromContractAddress)
 						if err != nil {
 							log.Errorf("[sideToAlliance] failed to get contract address from bytes: %v", err)
 							continue
 						}
 						fromContractStr := fromContract.ToHexString()
-						for _, v := range contractSet {
-							if fromContractStr == v {
-								isTarget = true
-								break
+						for _, v := range this.config.TargetContracts {
+							arr, ok := v[fromContractStr]
+							if ok {
+								if len(arr["outbound"]) == 0 {
+									isTarget = true
+									break
+								}
+								for _, id := range arr["outbound"] {
+									if id == param.ToChainID {
+										isTarget = true
+										break
+									}
+								}
+								if isTarget {
+									break
+								}
 							}
 						}
 						if !isTarget {
@@ -321,10 +347,15 @@ func (this *SyncService) sideToAlliance(m, n uint32) error {
 						if ok {
 							return fmt.Errorf("[sideToAlliance] this.syncProofToAlia error:%s", err)
 						} else {
-							log.Errorf("[sideToAlliance] this.syncProofToAlia error:%s", err)
+							if strings.Contains(err.Error(), "tx already done") {
+								log.Debugf("[sideToAlliance] ont tx %s already on poly", event.TxHash)
+								continue
+							}
+							log.Errorf("[sideToAlliance] ontology tx %s failed to relay: %v", event.TxHash, err)
+							continue
 						}
 					}
-					log.Infof("[sideToAlliance] syncProofToAlia ( poly_tx: %s, ont_tx: %s )",
+					log.Infof("[sideToAlliance] relay ontology tx to poly ( poly_tx: %s, ont_tx: %s )",
 						txHash.ToHexString(), event.TxHash)
 				}
 			}

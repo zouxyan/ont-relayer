@@ -46,7 +46,7 @@ type Config struct {
 	GasLimit                  uint64
 	SideToAlliForceSyncHeight uint64
 	AlliToSideForceSyncHeight uint64
-	TargetContracts map[string][]string
+	TargetContracts []map[string]map[string][]uint64
 }
 
 //NewConfig retuen a TestConfig instance
